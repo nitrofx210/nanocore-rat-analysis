@@ -1,0 +1,120 @@
+| * ============================================================
+| * NanoCore RAT — Splunk Detection Rules
+| * Source: Orange CyberDefense CyberSOC Blog (2020)
+| * Enhanced with 138-combo pattern lookup
+| * ============================================================
+
+| * ── RULE 1: Registry Run Key (Event 4657 / Sysmon) ──────────
+| *
+| * Detects any of the 138 NanoCore Run key name variants
+| * being written to HKCU\...\CurrentVersion\Run
+| *
+| * Prerequisites:
+| *   - Windows Security Audit for Object Access enabled
+| *   - registry_malware_pattern.csv uploaded as Splunk lookup
+| *     (generate with: python reversing/nanocore_pattern_generator.py)
+
+index=wineventlog EventCode=4657
+| eval reg_path = lower(Object_Name)
+| search reg_path="*\\software\\microsoft\\windows\\currentversion\\run\\*"
+| eval key_name = mvindex(split(Object_Name, "\\"), -1)
+| lookup registry_malware_pattern "RUN Key Name" AS key_name
+    OUTPUT Description AS malware_family
+| where isnotnull(malware_family)
+| eval alert_type = "REGISTRY_PERSISTENCE"
+| table _time, host, user, Object_Name, key_name, malware_family, alert_type
+| sort -_time
+
+
+| * ── RULE 2: Registry Run Key via Sysmon (Event 13) ──────────
+| * (Field name differs from Win Security — normalized here)
+
+index=sysmon EventCode=13
+| eval reg_path     = lower(TargetObject)
+| eval key_name     = mvindex(split(TargetObject, "\\"), -1)
+| search reg_path="*\\currentversion\\run\\*"
+| lookup registry_malware_pattern "RUN Key Name" AS key_name
+    OUTPUT Description AS malware_family
+| where isnotnull(malware_family)
+| eval alert_type = "REGISTRY_PERSISTENCE_SYSMON"
+| table _time, host, user, TargetObject, key_name, Details, malware_family
+
+
+| * ── RULE 3: Scheduled Task Creation ─────────────────────────
+| * Detects scheduled task creation with NanoCore task name variants
+| * Events 4698 (created), 4702 (updated)
+
+index=wineventlog (EventCode=4698 OR EventCode=4702)
+| rex field=_raw "Task Name:\s+(?<task_name>[^\r\n]+)"
+| eval task_name = trim(task_name)
+| lookup registry_malware_pattern "RUN Key Name" AS task_name
+    OUTPUT Description AS malware_family
+| where isnotnull(malware_family)
+| eval alert_type = "SCHEDULED_TASK_PERSISTENCE"
+| table _time, host, user, task_name, malware_family, alert_type
+
+
+| * ── RULE 4: Network Beaconing (C2 Detection) ─────────────────
+| * Detects regular interval connections to single dest on port 5985
+
+index=firewall action=allowed
+| where dest_port=5985 OR dest_port=5986
+| timechart span=10s count by dest_ip
+| eval regularity = if(stddev < 2.5 AND count > 3, "BEACON", "normal")
+| where regularity="BEACON"
+| eval alert_type = "NANOCORE_C2_BEACON"
+| table _time, dest_ip, count, regularity
+
+
+| * ── RULE 5: DNS Beacon to 8.8.4.4 ──────────────────────────
+
+index=dns
+| where query_type="A" AND dest="8.8.4.4"
+| stats count by src_ip _time
+| where count > 10
+| eval alert_type = "DNS_BEACON_8844"
+| table _time, src_ip, count, alert_type
+
+
+| * ── RULE 6: AppData EXE Execution ───────────────────────────
+| * Detects PE execution from %AppData%\Roaming — common dropper path
+
+index=sysmon EventCode=1
+| where match(Image, "(?i)\\\\AppData\\\\Roaming\\\\[a-zA-Z]{8,}\.exe")
+| eval suspicious_path = Image
+| eval alert_type = "APPDATA_EXECUTION"
+| table _time, host, user, Image, CommandLine, ParentImage, alert_type
+
+
+| * ── RULE 7: WER Crash Artifact ─────────────────────────────
+| * Detects Windows Error Reporting writing NanoCore crash file
+
+index=sysmon EventCode=11
+| where match(TargetFilename, "(?i)WER\\\\ReportQueue\\\\AppCrash_.*\.exe")
+| eval alert_type = "WER_CRASH_ARTIFACT"
+| table _time, host, user, TargetFilename, Image, alert_type
+
+
+| * ── CORRELATION RULE: Multi-signal NanoCore detection ────────
+| * Correlates Registry + Network + WER within 30 minutes
+| * High-fidelity detection with minimal false positives
+
+index=wineventlog OR index=sysmon OR index=firewall OR index=dns
+| eval has_reg = if(EventCode=4657 OR EventCode=13, 1, 0)
+| eval has_net = if(dest_port=5985 OR dest="8.8.4.4", 1, 0)
+| eval has_wer = if(match(TargetFilename, "WER.*AppCrash"), 1, 0)
+| bin _time span=30m
+| stats sum(has_reg) AS reg_hits,
+        sum(has_net) AS net_hits,
+        sum(has_wer) AS wer_hits
+        by host _time
+| where reg_hits > 0 AND (net_hits > 0 OR wer_hits > 0)
+| eval confidence = case(
+    reg_hits>0 AND net_hits>0 AND wer_hits>0, "HIGH",
+    reg_hits>0 AND net_hits>0,                "MEDIUM",
+    reg_hits>0 AND wer_hits>0,                "MEDIUM",
+    true(), "LOW"
+)
+| eval malware = "NanoCore-RAT"
+| table _time, host, reg_hits, net_hits, wer_hits, confidence, malware
+| sort -confidence -_time
