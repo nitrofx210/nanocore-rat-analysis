@@ -387,6 +387,6 @@ python detection/nanocore_bazaar_pipeline.py
 
 **Aryan** — M.Tech Cybersecurity & Systems of Networks  
 Amrita School of Computing, Amritapuri Campus  
-`AM.SC.P2CSN25005`
+`AM.SC.P2CSN25003`
 
 > ⚠️ **Disclaimer:** This repository is for educational and research purposes only. All analysis was performed in an isolated FLARE-VM environment. Do not execute malware samples outside a controlled sandbox.
